@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).parent
+FISH_DEFAULT_VOICE_ID = "bf322df2096a46f18c579d0baa36f41d"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR = DATA_DIR / "jobs"
@@ -26,7 +27,7 @@ class RenderRequest(BaseModel):
     pixabay_key: str = ""
     voice_provider: str = "elevenlabs"
     voice_key: str = ""
-    voice_id: str = ""
+    voice_id: str = FISH_DEFAULT_VOICE_ID
     aspect: str = "9:16"
     quality: str = "1080p"
     subtitle_size: int = Field(default=22, ge=12, le=48)
@@ -91,7 +92,7 @@ def search_clips(req: RenderRequest, sentence: str) -> list[dict]:
 def generate_voice(req: RenderRequest, script: str, out: Path):
     if not req.voice_key: raise RuntimeError("Add the selected voice provider API key in Settings.")
     if req.voice_provider=="fish":
-        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json"},json={"text":script,"reference_id":req.voice_id or "","format":"mp3","mp3_bitrate":128},timeout=240)
+        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json"},json={"text":script,"reference_id":req.voice_id or FISH_DEFAULT_VOICE_ID,"format":"mp3","mp3_bitrate":128},timeout=240)
     else:
         voice=req.voice_id or "21m00Tcm4TlvDq8ikWAM"
         r=requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice}",headers={"xi-api-key":req.voice_key,"Content-Type":"application/json","Accept":"audio/mpeg"},json={"text":script,"model_id":"eleven_multilingual_v2","voice_settings":{"stability":0.48,"similarity_boost":0.78,"style":0.25,"use_speaker_boost":True}},timeout=240)
@@ -166,6 +167,43 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
 
 @app.get("/api/health")
 def health(): return {"ok":True,"service":"Content Tool"}
+
+@app.post("/api/fish/voices")
+async def list_fish_voices(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Send a valid JSON body with api_key.")
+    api_key = str(payload.get("api_key", "")).strip()
+    if not api_key:
+        raise HTTPException(400, "Add your Fish Audio API key in API settings first.")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    voices = {}
+    for owned in (False, True):
+        try:
+            response = requests.get("https://api.fish.audio/model", headers=headers,
+                params={"page_size": 100, "page_number": 1, "sort_by": "score", "self": str(owned).lower()}, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            for item in items:
+                if not isinstance(item, dict) or item.get("type", "tts") != "tts":
+                    continue
+                if item.get("state") not in (None, "trained"):
+                    continue
+                model_id = item.get("_id") or item.get("id")
+                if not model_id:
+                    continue
+                author = item.get("author") or {}
+                if not isinstance(author, dict):
+                    author = {}
+                voices[str(model_id)] = {"id": str(model_id), "title": str(item.get("title") or "Untitled voice"),
+                    "author": str(author.get("nickname") or author.get("username") or ""), "owned": owned}
+        except requests.RequestException as exc:
+            if not voices:
+                status = getattr(getattr(exc, "response", None), "status_code", 502)
+                raise HTTPException(status, "Could not load Fish Audio voices. Check your API key and try again.")
+    return {"voices": list(voices.values()), "default_voice_id": FISH_DEFAULT_VOICE_ID}
 
 @app.post("/api/jobs")
 async def create_job(request: Request):
