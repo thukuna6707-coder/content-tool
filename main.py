@@ -78,15 +78,50 @@ def pixabay_search(key: str, query: str, per_page=12) -> list[dict]:
         if f and f.get("url"): out.append({"url":f["url"],"description":v.get("tags",""),"source":"Pixabay"})
     return out
 
+def stock_search_query(*parts: str, max_chars: int = 88) -> str:
+    """Build a short, useful stock-video query (Pixabay q must stay under 100 chars)."""
+    stop = {"the", "and", "for", "with", "from", "that", "this", "then", "they", "them", "their", "into", "over", "under", "what", "how", "why", "when", "where", "who", "are", "was", "were", "has", "have", "had", "you", "your", "its", "are", "begins", "begin", "next", "finally", "actually", "called", "carefully", "several", "days"}
+    words=[]; seen=set()
+    for part in parts:
+        for word in re.findall(r"[a-zA-Z0-9]+", part.lower()):
+            if len(word) < 3 or word in stop or word in seen:
+                continue
+            candidate=" ".join(words+[word])
+            if len(candidate) > max_chars:
+                continue
+            words.append(word); seen.add(word)
+            if len(words) >= 10:
+                return " ".join(words)
+    return " ".join(words)
+
+
 def search_clips(req: RenderRequest, sentence: str) -> list[dict]:
-    q = " ".join([req.topic, sentence, req.keywords]).strip()[:180]
+    # Keep the scene first so each sentence gets relevant footage; user keywords
+    # are supplemental rather than being appended as a long unbounded string.
+    q = stock_search_query(sentence, req.topic, req.keywords, max_chars=88)
     clips=[]
     providers = [req.stock_provider] if req.stock_provider in ("pexels","pixabay") else ["pexels","pixabay"]
     for provider in providers:
+        key = req.pexels_key or os.getenv("PEXELS_API_KEY","") if provider == "pexels" else req.pixabay_key or os.getenv("PIXABAY_API_KEY","")
+        if not key:
+            continue
         try:
-            if provider=="pexels": clips += pexels_search(req.pexels_key or os.getenv("PEXELS_API_KEY",""), q)
-            else: clips += pixabay_search(req.pixabay_key or os.getenv("PIXABAY_API_KEY",""), q)
-        except Exception as e: print(f"{provider} search warning: {e}")
+            if provider == "pexels":
+                clips += pexels_search(key, q)
+            else:
+                # Pixabay accepts short q values; broaden only when a valid search
+                # returns no clips. Never include the API key in logged exceptions.
+                fallback_queries = [q, stock_search_query(req.topic, req.keywords, max_chars=70), stock_search_query(req.topic, max_chars=45)]
+                for fallback in dict.fromkeys(x for x in fallback_queries if x):
+                    found = pixabay_search(key, fallback)
+                    if found:
+                        clips += found
+                        break
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            print(f"{provider} search warning: HTTP {status}; query length={len(q)}")
+        except Exception as e:
+            print(f"{provider} search warning: {type(e).__name__}")
     return sorted(clips,key=lambda c:score_clip(c, sentence+" "+req.topic),reverse=True)
 
 def generate_voice(req: RenderRequest, script: str, out: Path):
