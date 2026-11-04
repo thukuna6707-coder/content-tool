@@ -12,32 +12,24 @@ function openSettings(){$("settingsModal").classList.remove("hidden")}
 $("settingsOpen").onclick=openSettings;$("settingsOpen2").onclick=openSettings;$("settingsClose").onclick=()=>$("settingsModal").classList.add("hidden");
 $("saveKeys").onclick=()=>{keys.pexels=$("pexelsKey").value.trim();keys.pixabay=$("pixabayKey").value.trim();keys.eleven=$("elevenKey").value.trim();keys.fish=$("fishKey").value.trim();refreshKeys();$("settingsModal").classList.add("hidden");toast("Keys saved in this tab session.")};
 $("clearKeys").onclick=()=>{Object.keys(keys).forEach(k=>keys[k]="");["pexelsKey","pixabayKey","elevenKey","fishKey"].forEach(k=>$(k).value="");refreshKeys();toast("API keys cleared.")};
-function refreshKeys(){[["pexels","Pexels"],["pixabay","Pixabay"],["eleven","ElevenLabs"],["fish","Fish Audio"]].forEach(([k,label])=>{$(k+"Status").textContent=keys[k]?"Key added":"Not connected";$(k+"Dot").classList.toggle("on",!!keys[k])})}
+function refreshKeys(){[["pexels","Pexels"],["pixabay","Pixabay"],["eleven","ElevenLabs"],["fish","Fish Audio"]].forEach(([k])=>{$(k+"Status").textContent=keys[k]?"Key added":"Not connected";$(k+"Dot").classList.toggle("on",!!keys[k])})}
 $("music").onchange=e=>{musicFile=e.target.files[0]||null;$("musicName").textContent=musicFile?musicFile.name:"Add background music"};
 $("musicVolume").oninput=e=>$("volumeValue").textContent=Math.round(+e.target.value*100)+"%";
 $("renderBtn").onclick=async()=>{
- const topic=$("topic").value.trim(),script=$("script").value.trim();
+ const topic=$("topic").value.trim(),script=$("script").value.trim(),vp=$("voiceProvider").value,sp=$("stockProvider").value;
  if(topic.length<2||script.length<20){toast("Add a topic and a longer script first.");return}
- const vp=$("voiceProvider").value,sp=$("stockProvider").value;
- if(!(keys.pexels||keys.pixabay)&&sp==="both"){toast("Add at least one stock footage key.");openSettings();return}
- if(sp==="pexels"&&!keys.pexels||sp==="pixabay"&&!keys.pixabay){toast("Add the selected stock provider key.");openSettings();return}
+ if(!(keys.pexels||keys.pixabay)&&sp==="both"||sp==="pexels"&&!keys.pexels||sp==="pixabay"&&!keys.pixabay){toast("Add the selected stock footage API key.");openSettings();return}
  if(!keys[vp==="fish"?"fish":"eleven"]){toast("Add your selected voice provider key.");openSettings();return}
  const payload={topic,script,keywords:$("keywords").value,stock_provider:sp,pexels_key:keys.pexels,pixabay_key:keys.pixabay,voice_provider:vp,voice_key:keys[vp==="fish"?"fish":"eleven"],voice_id:$("voiceId").value.trim(),aspect,quality,subtitle_size:+$("subtitleSize").value||22,subtitle_color:$("subtitleColor").value,subtitle_background:$("subtitleBg").checked,music_volume:+$("musicVolume").value};
- const form=new FormData();form.append("req",JSON.stringify(payload));
- // FastAPI accepts a JSON body for RenderRequest; music is uploaded in a second multipart-compatible request only in future versions.
- let res;
+ const form=new FormData();form.append("payload",JSON.stringify(payload));if(musicFile)form.append("music",musicFile);
  $("renderBtn").disabled=true;$("renderBtn").textContent="Starting render…";$("progressPanel").classList.remove("hidden");$("result").classList.add("hidden");$("error").classList.add("hidden");$("progressTitle").textContent="Preparing your video";
- try{
-   res=await fetch("/api/jobs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-   const data=await res.json();if(!res.ok)throw new Error(data.detail||"Could not start render.");
-   activeJob=data.id;pollJob();
- }catch(e){showError(e.message);$("renderBtn").disabled=false;$("renderBtn").innerHTML="<span>✦</span> Generate video <span>→</span>"}
+ try{const res=await fetch("/api/jobs",{method:"POST",body:form});const data=await res.json();if(!res.ok)throw new Error(data.detail||"Could not start render.");activeJob=data.id;pollJob()}
+ catch(e){showError(e.message);finishButton()}
 };
 async function pollJob(){if(!activeJob)return;try{const r=await fetch("/api/jobs/"+activeJob);const j=await r.json();$("progressTitle").textContent=j.status==="completed"?"Your video is ready":j.status==="failed"?"Render failed":"Preparing your video";$("progressStage").textContent=j.stage||"Working…";$("progressPct").textContent=(j.progress||0)+"%";$("progressFill").style.width=(j.progress||0)+"%";
  if(j.status==="completed"){$("result").classList.remove("hidden");$("downloadBtn").href=j.download_url;$("sceneSummary").textContent=(j.scenes||[]).length+" matched scenes assembled with subtitles.";finishButton();return}
  if(j.status==="failed"){showError(j.error||"The render failed.");finishButton();return}
- setTimeout(pollJob,2500);
- }catch(e){showError(e.message);finishButton()}}
+ setTimeout(pollJob,2500)}catch(e){showError(e.message);finishButton()}}
 function finishButton(){$("renderBtn").disabled=false;$("renderBtn").innerHTML="<span>✦</span> Generate another video <span>→</span>"}
 function showError(msg){$("error").textContent=msg;$("error").classList.remove("hidden");$("progressPanel").classList.remove("hidden");$("progressTitle").textContent="Something needs attention";$("progressStage").textContent="Check your settings and try again."}
 refreshKeys();updateCount();

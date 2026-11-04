@@ -1,9 +1,9 @@
 from __future__ import annotations
-import os, re, uuid, json, time, shutil, subprocess, threading, math
+import os, re, uuid, time, subprocess, threading
 from pathlib import Path
 from typing import Optional
 import requests
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -27,7 +27,6 @@ class RenderRequest(BaseModel):
     voice_provider: str = "elevenlabs"
     voice_key: str = ""
     voice_id: str = ""
-    fish_model: str = "s1"
     aspect: str = "9:16"
     quality: str = "1080p"
     subtitle_size: int = Field(default=22, ge=12, le=48)
@@ -54,9 +53,8 @@ def tokens(text: str) -> set[str]:
 
 def score_clip(clip: dict, query: str) -> float:
     words = tokens(query)
-    tags = tokens(" ".join([clip.get("description",""), clip.get("url",""), clip.get("user","")]))
-    overlap = len(words & tags) / max(1, len(words))
-    return overlap
+    tags = tokens(" ".join([clip.get("description",""), clip.get("url","")]))
+    return len(words & tags) / max(1, len(words))
 
 def pexels_search(key: str, query: str, per_page=12) -> list[dict]:
     if not key: return []
@@ -66,7 +64,7 @@ def pexels_search(key: str, query: str, per_page=12) -> list[dict]:
     for v in r.json().get("videos",[]):
         files=sorted(v.get("video_files",[]), key=lambda x:(x.get("width",0)*x.get("height",0), x.get("quality")=="hd"), reverse=True)
         f=next((x for x in files if x.get("file_type")=="video/mp4" and x.get("link")), None)
-        if f: out.append({"url":f["link"],"duration":v.get("duration",8),"description":v.get("url","")+" "+str(v.get("user",{}).get("name","")),"source":"Pexels","id":v.get("id")})
+        if f: out.append({"url":f["link"],"description":v.get("url",""),"source":"Pexels"})
     return out
 
 def pixabay_search(key: str, query: str, per_page=12) -> list[dict]:
@@ -75,9 +73,8 @@ def pixabay_search(key: str, query: str, per_page=12) -> list[dict]:
     r.raise_for_status()
     out=[]
     for v in r.json().get("hits",[]):
-        videos=v.get("videos",{})
-        f=videos.get("large") or videos.get("medium") or videos.get("small")
-        if f and f.get("url"): out.append({"url":f["url"],"duration":v.get("duration",8),"description":v.get("tags",""),"source":"Pixabay","id":v.get("id")})
+        videos=v.get("videos",{}); f=videos.get("large") or videos.get("medium") or videos.get("small")
+        if f and f.get("url"): out.append({"url":f["url"],"description":v.get("tags",""),"source":"Pixabay"})
     return out
 
 def search_clips(req: RenderRequest, sentence: str) -> list[dict]:
@@ -88,24 +85,16 @@ def search_clips(req: RenderRequest, sentence: str) -> list[dict]:
         try:
             if provider=="pexels": clips += pexels_search(req.pexels_key or os.getenv("PEXELS_API_KEY",""), q)
             else: clips += pixabay_search(req.pixabay_key or os.getenv("PIXABAY_API_KEY",""), q)
-        except Exception as e:
-            print(f"{provider} search warning: {e}")
+        except Exception as e: print(f"{provider} search warning: {e}")
     return sorted(clips,key=lambda c:score_clip(c, sentence+" "+req.topic),reverse=True)
 
 def generate_voice(req: RenderRequest, script: str, out: Path):
-    key=req.voice_key
-    if not key: raise RuntimeError("Add the selected voice provider API key in Settings.")
+    if not req.voice_key: raise RuntimeError("Add the selected voice provider API key in Settings.")
     if req.voice_provider=="fish":
-        url="https://api.fish.audio/v1/tts"
-        headers={"Authorization":f"Bearer {key}","Content-Type":"application/json","model":"s1"}
-        payload={"text":script,"reference_id":req.voice_id or "","format":"mp3","mp3_bitrate":128}
-        r=requests.post(url,headers=headers,json=payload,timeout=180)
+        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json"},json={"text":script,"reference_id":req.voice_id or "","format":"mp3","mp3_bitrate":128},timeout=240)
     else:
         voice=req.voice_id or "21m00Tcm4TlvDq8ikWAM"
-        url=f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
-        headers={"xi-api-key":key,"Content-Type":"application/json","Accept":"audio/mpeg"}
-        payload={"text":script,"model_id":"eleven_multilingual_v2","voice_settings":{"stability":0.48,"similarity_boost":0.78,"style":0.25,"use_speaker_boost":True}}
-        r=requests.post(url,headers=headers,json=payload,timeout=180)
+        r=requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice}",headers={"xi-api-key":req.voice_key,"Content-Type":"application/json","Accept":"audio/mpeg"},json={"text":script,"model_id":"eleven_multilingual_v2","voice_settings":{"stability":0.48,"similarity_boost":0.78,"style":0.25,"use_speaker_boost":True}},timeout=240)
     if not r.ok: raise RuntimeError(f"Voice API error ({r.status_code}): {r.text[:700]}")
     out.write_bytes(r.content)
 
@@ -136,72 +125,69 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
     try:
         update(status="processing",stage="Generating narration",progress=5)
         voice=folder/"voice.mp3"; generate_voice(req,req.script,voice)
-        duration=ffprobe_duration(voice)
-        sentences=split_sentences(req.script)
+        duration=ffprobe_duration(voice); sentences=split_sentences(req.script)
         if not sentences: raise RuntimeError("The script has no readable sentences.")
         update(stage="Searching stock footage",progress=14)
-        # Search by each sentence first; keep the strongest distinct footage choices.
         selected=[]; seen=set()
         for i,sentence in enumerate(sentences):
             clips=search_clips(req,sentence)
             best=next((c for c in clips if c["url"] not in seen),None)
-            if best:
-                seen.add(best["url"]); selected.append((sentence,best))
+            if best: seen.add(best["url"]); selected.append((sentence,best))
             update(progress=14+int(34*(i+1)/len(sentences)),stage=f"Matching scene {i+1}/{len(sentences)}")
         if not selected: raise RuntimeError("No stock footage found. Check your API keys and try broader keywords.")
-        # Distribute narration duration across matched scenes by sentence word count.
-        weights=[max(1,len(re.findall(r"\w+",s))) for s,_ in selected]
-        total=sum(weights); target_w=1080 if req.quality=="1080p" else 720
-        if req.aspect=="16:9": width,height=target_w,int(target_w*9/16)
-        elif req.aspect=="1:1": width=height=target_w
-        else: width,height=int(target_w*9/16),target_w
-        segments=[]
-        update(stage="Downloading and assembling scenes",progress=50)
+        weights=[max(1,len(re.findall(r"\w+",s))) for s,_ in selected]; total=sum(weights)
+        target=1080 if req.quality=="1080p" else 720
+        if req.aspect=="16:9": width,height=target,int(target*9/16)
+        elif req.aspect=="1:1": width=height=target
+        else: width,height=int(target*9/16),target
+        segments=[]; update(stage="Downloading and assembling scenes",progress=50)
         for i,(sentence,clip) in enumerate(selected):
-            raw=folder/f"raw_{i}.mp4"; seg=folder/f"scene_{i}.mp4"
-            download_clip(clip["url"],raw)
+            raw=folder/f"raw_{i}.mp4"; seg=folder/f"scene_{i}.mp4"; download_clip(clip["url"],raw)
             seg_duration=max(1.0,duration*weights[i]/total)
-            # Loop short clips to cover their assigned narration segment.
-            run(["ffmpeg","-y","-stream_loop","-1","-i",str(raw),"-t",f"{seg_duration:.3f}","-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps=30","-an","-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",str(seg)],timeout=240)
-            segments.append(seg)
-            raw.unlink(missing_ok=True)
+            run(["ffmpeg","-y","-stream_loop","-1","-i",str(raw),"-t",f"{seg_duration:.3f}","-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps=30","-an","-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",str(seg)],timeout=300)
+            segments.append(seg); raw.unlink(missing_ok=True)
             update(progress=50+int(25*(i+1)/len(selected)),stage=f"Preparing scene {i+1}/{len(selected)}")
-        concat=folder/"concat.txt"
-        concat.write_text("\n".join("file '"+p.name+"'" for p in segments),encoding="utf-8")
-        silent=folder/"silent.mp4"
-        run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(concat),"-c","copy",str(silent)],timeout=300)
-        final=folder/"content-tool.mp4"; srt=folder/"subtitles.srt"
-        write_srt([s for s,_ in selected],duration,srt)
+        concat=folder/"concat.txt"; concat.write_text("\n".join("file '"+p.name+"'" for p in segments),encoding="utf-8")
+        silent=folder/"silent.mp4"; run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(concat),"-c","copy",str(silent)],timeout=300)
+        final=folder/"content-tool.mp4"; srt=folder/"subtitles.srt"; write_srt([s for s,_ in selected],duration,srt)
         update(stage="Burning subtitles and mixing audio",progress=80)
         color=req.subtitle_color.lstrip("#")
-        subtitle_filter=f"subtitles={srt.as_posix()}:force_style='FontName=DejaVu Sans,FontSize={req.subtitle_size},Bold=1,PrimaryColour=&H00{color[4:6]}{color[2:4]}{color[0:2]},Outline=2,Shadow=1,Alignment=2,MarginV=70'"
+        back="BorderStyle=3,BackColour=&H90000000,Outline=0" if req.subtitle_background else "BorderStyle=1,Outline=2"
+        subtitle_filter=f"subtitles={srt.as_posix()}:force_style='FontName=DejaVu Sans,FontSize={req.subtitle_size},Bold=1,PrimaryColour=&H00{color[4:6]}{color[2:4]}{color[0:2]},{back},Shadow=1,Alignment=2,MarginV=70'"
         cmd=["ffmpeg","-y","-i",str(silent),"-i",str(voice)]
-        if music_path and music_path.exists(): cmd += ["-i",str(music_path)]
+        has_music=bool(music_path and music_path.exists())
+        if has_music: cmd += ["-i",str(music_path)]
         cmd += ["-vf",subtitle_filter,"-map","0:v:0","-map","1:a:0"]
-        if music_path and music_path.exists():
-            cmd += ["-filter_complex",f"[2:a]volume={req.music_volume}[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]","-map","[a]"]
+        if has_music: cmd += ["-filter_complex",f"[2:a]volume={req.music_volume}[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]","-map","[a]"]
         cmd += ["-c:v","libx264","-preset","veryfast","-crf","22","-c:a","aac","-b:a","192k","-shortest","-movflags","+faststart",str(final)]
-        run(cmd,timeout=600)
+        run(cmd,timeout=900)
         update(status="completed",stage="Ready to download",progress=100,download_url=f"/api/jobs/{job_id}/download",scenes=[{"sentence":s,"source":c["source"],"duration":round(duration*w/total,1)} for (s,c),w in zip(selected,weights)])
-    except Exception as e:
-        update(status="failed",stage="Render failed",error=str(e)[:1600],progress=100)
+    except Exception as e: update(status="failed",stage="Render failed",error=str(e)[:1600],progress=100)
 
 @app.get("/api/health")
 def health(): return {"ok":True,"service":"Content Tool"}
 
 @app.post("/api/jobs")
-async def create_job(req: RenderRequest, music: UploadFile | None = File(default=None)):
-    # Multipart clients may submit the request as a JSON form field named payload.
+async def create_job(request: Request):
+    music_path=None
+    if "multipart/form-data" in request.headers.get("content-type",""):
+        form=await request.form()
+        try: req=RenderRequest.model_validate_json(form.get("payload","{}"))
+        except Exception as e: raise HTTPException(422,str(e))
+        music=form.get("music")
+    else:
+        try: req=RenderRequest.model_validate(await request.json())
+        except Exception as e: raise HTTPException(422,str(e))
+        music=None
     if not req.pexels_key and not req.pixabay_key and not os.getenv("PEXELS_API_KEY") and not os.getenv("PIXABAY_API_KEY"):
         raise HTTPException(400,"Add at least one stock footage API key.")
-    job_id=uuid.uuid4().hex[:12]
-    music_path=None
-    if music:
+    if music and isinstance(music,UploadFile):
         if music.content_type not in ("audio/mpeg","audio/mp3","audio/wav","audio/x-wav","audio/mp4","audio/aac","audio/ogg"):
             raise HTTPException(400,"Unsupported music file type.")
-        music_path=JOBS_DIR/job_id/"background"+Path(music.filename or "music.mp3").suffix
-        music_path.parent.mkdir(parents=True,exist_ok=True)
-        music_path.write_bytes(await music.read())
+        ext=Path(music.filename or "music.mp3").suffix or ".mp3"
+        folder=JOBS_DIR/uuid.uuid4().hex[:12]; folder.mkdir(parents=True,exist_ok=True)
+        music_path=folder/f"background{ext}"; music_path.write_bytes(await music.read())
+    job_id=uuid.uuid4().hex[:12]
     with lock: jobs[job_id]={"id":job_id,"status":"queued","stage":"Waiting to start","progress":0,"created":time.time()}
     threading.Thread(target=render_job,args=(job_id,req,music_path),daemon=True).start()
     return {"id":job_id,"status":"queued"}
