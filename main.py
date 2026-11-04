@@ -38,7 +38,11 @@ class RenderRequest(BaseModel):
 def run(cmd, timeout=600):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if p.returncode:
-        raise RuntimeError((p.stderr or p.stdout)[-2500:])
+        details = (p.stderr or p.stdout)[-2200:]
+        if p.returncode < 0:
+            signal_number = -p.returncode
+            raise RuntimeError(f"FFmpeg was terminated by signal {signal_number}. This can happen when the renderer exceeds its memory limit.\n{details}")
+        raise RuntimeError(details)
     return p.stdout.strip()
 
 def ffprobe_duration(path: Path) -> float:
@@ -180,7 +184,9 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         for i,(sentence,clip) in enumerate(selected):
             raw=folder/f"raw_{i}.mp4"; seg=folder/f"scene_{i}.mp4"; download_clip(clip["url"],raw)
             seg_duration=max(1.0,duration*weights[i]/total)
-            run(["ffmpeg","-y","-stream_loop","-1","-i",str(raw),"-t",f"{seg_duration:.3f}","-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps=30","-an","-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p",str(seg)],timeout=300)
+            run(["ffmpeg","-y","-threads","2","-filter_threads","1","-stream_loop","-1","-i",str(raw),"-t",f"{seg_duration:.3f}","-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps=30","-an","-c:v","libx264","-threads","2","-preset","ultrafast","-crf","23","-pix_fmt","yuv420p",str(seg)],timeout=300)
+            if not seg.exists() or seg.stat().st_size < 1024:
+                raise RuntimeError(f"FFmpeg did not produce a valid video file for scene {i+1}. The downloaded source may contain no decodable video frames.")
             segments.append(seg); raw.unlink(missing_ok=True)
             update(progress=50+int(25*(i+1)/len(selected)),stage=f"Preparing scene {i+1}/{len(selected)}")
         concat=folder/"concat.txt"; concat.write_text("\n".join("file '"+p.name+"'" for p in segments),encoding="utf-8")
@@ -190,12 +196,12 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         color=req.subtitle_color.lstrip("#")
         back="BorderStyle=3,BackColour=&H90000000,Outline=0" if req.subtitle_background else "BorderStyle=1,Outline=2"
         subtitle_filter=f"subtitles={srt.as_posix()}:force_style='FontName=DejaVu Sans,FontSize={req.subtitle_size},Bold=1,PrimaryColour=&H00{color[4:6]}{color[2:4]}{color[0:2]},{back},Shadow=1,Alignment=2,MarginV=70'"
-        cmd=["ffmpeg","-y","-i",str(silent),"-i",str(voice)]
+        cmd=["ffmpeg","-y","-threads","2","-filter_threads","1","-filter_complex_threads","1","-i",str(silent),"-i",str(voice)]
         has_music=bool(music_path and music_path.exists())
         if has_music: cmd += ["-i",str(music_path)]
         cmd += ["-vf",subtitle_filter,"-map","0:v:0","-map","1:a:0"]
         if has_music: cmd += ["-filter_complex",f"[2:a]volume={req.music_volume}[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]","-map","[a]"]
-        cmd += ["-c:v","libx264","-preset","veryfast","-crf","22","-c:a","aac","-b:a","192k","-shortest","-movflags","+faststart",str(final)]
+        cmd += ["-c:v","libx264","-threads","2","-preset","ultrafast","-crf","22","-c:a","aac","-b:a","192k","-shortest","-movflags","+faststart",str(final)]
         run(cmd,timeout=900)
         update(status="completed",stage="Ready to download",progress=100,download_url=f"/api/jobs/{job_id}/download",scenes=[{"sentence":s,"source":c["source"],"duration":round(duration*w/total,1)} for (s,c),w in zip(selected,weights)])
     except Exception as e: update(status="failed",stage="Render failed",error=str(e)[:1600],progress=100)
