@@ -30,9 +30,21 @@ class RenderRequest(BaseModel):
     voice_id: str = FISH_DEFAULT_VOICE_ID
     aspect: str = "9:16"
     quality: str = "1080p"
-    subtitle_size: int = Field(default=22, ge=12, le=48)
+    subtitle_size: int = Field(default=48, ge=12, le=72)
     subtitle_color: str = "#ffffff"
+    subtitle_highlight_color: str = "#8cf4ff"
+    subtitle_outline_color: str = "#080808"
+    subtitle_outline_width: int = Field(default=3, ge=0, le=8)
     subtitle_background: bool = True
+    subtitle_background_color: str = "#101522"
+    subtitle_position: str = "bottom"
+    subtitle_animation: str = "fade"
+    subtitle_mode: str = "sentence"
+    subtitle_phrase_words: int = Field(default=3, ge=2, le=6)
+    subtitle_font: str = "DejaVu Sans"
+    subtitle_weight: str = "bold"
+    subtitle_uppercase: bool = False
+    subtitle_template_id: str = "clean-white-0"
     music_volume: float = Field(default=0.12, ge=0, le=1)
 
 def run(cmd, timeout=600):
@@ -142,13 +154,59 @@ def srt_time(seconds: float) -> str:
     ms=int(seconds*1000); h=ms//3600000; ms%=3600000; m=ms//60000; ms%=60000; s=ms//1000; ms%=1000
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-def write_srt(sentences: list[str], duration: float, path: Path):
+def ass_time(seconds: float) -> str:
+    cs=max(0,int(seconds*100)); h=cs//360000; cs%=360000; m=cs//6000; cs%=6000; sec=cs//100; cs%=100
+    return f"{h}:{m:02}:{sec:02}.{cs:02}"
+
+def ass_color(value: str) -> str:
+    value=value if re.fullmatch(r"#[0-9a-fA-F]{6}",value or "") else "#ffffff"
+    return "&H00"+value[5:7]+value[3:5]+value[1:3]
+
+def write_ass(sentences: list[str], duration: float, path: Path, req: RenderRequest):
     weights=[max(1,len(re.findall(r"\w+",s))) for s in sentences]
-    total=sum(weights) or 1; cursor=0; blocks=[]
-    for i,(sentence,w) in enumerate(zip(sentences,weights),1):
-        start=cursor; cursor += duration*w/total
-        blocks.append(f"{i}\n{srt_time(start)} --> {srt_time(cursor)}\n{sentence}\n")
-    path.write_text("\n".join(blocks),encoding="utf-8")
+    total=sum(weights) or 1
+    fonts={"DejaVu Sans","DejaVu Sans Condensed","DejaVu Serif","DejaVu Sans Mono"}
+    font=req.subtitle_font if req.subtitle_font in fonts else "DejaVu Sans"
+    alignment={"bottom":2,"middle":5,"top":8}.get(req.subtitle_position,2)
+    margin={"bottom":82,"middle":0,"top":70}.get(req.subtitle_position,82)
+    bold=1 if req.subtitle_weight in ("bold","heavy") else 0
+    outline=max(0,min(8,req.subtitle_outline_width))
+    border=3 if req.subtitle_background else 1
+    back=ass_color(req.subtitle_background_color).replace("&H00","&H55",1)
+    outline_color=ass_color(req.subtitle_outline_color)
+    primary=ass_color(req.subtitle_color)
+    highlight=ass_color(req.subtitle_highlight_color)
+    target=1080 if req.quality=="1080p" else 720
+    if req.aspect=="16:9": play_w,play_h=target,int(target*9/16)
+    elif req.aspect=="1:1": play_w=play_h=target
+    else: play_w,play_h=int(target*9/16),target
+    header=(f"[Script Info]\nScriptType: v4.00+\nPlayResX: {play_w}\nPlayResY: {play_h}\nScaledBorderAndShadow: yes\nWrapStyle: 2\n\n"
+      "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
+    style=f"Style: Default,{font},{req.subtitle_size},{primary},{highlight},{outline_color},{back},{bold},0,0,0,100,100,0,0,{border},{outline},1,{alignment},64,64,{margin},1\n\n"
+    events="[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    rows=[]; cursor=0.0
+    for sentence,w in zip(sentences,weights):
+        scene_duration=duration*w/total
+        if req.subtitle_uppercase: sentence=sentence.upper()
+        if req.subtitle_mode=="word":
+            units=[[word] for word in re.findall(r"\S+",sentence)]
+        elif req.subtitle_mode=="phrase":
+            words=re.findall(r"\S+",sentence); step=max(2,min(6,req.subtitle_phrase_words))
+            units=[words[i:i+step] for i in range(0,len(words),step)]
+        else:
+            units=[sentence.split()]
+        unit_weights=[max(1,sum(len(x) for x in unit)) for unit in units]
+        unit_total=sum(unit_weights) or 1; local=cursor
+        for unit,uw in zip(units,unit_weights):
+            end=local+scene_duration*uw/unit_total
+            text=" ".join(unit).replace("{","\\{").replace("}","\\}").replace("\\n"," ")
+            tags="{\\c"+highlight+"}" if req.subtitle_mode=="word" else ""
+            if req.subtitle_animation=="fade": tags+="{\\fad(100,100)}"
+            elif req.subtitle_animation=="pop": tags+="{\\fscx108\\fscy108\\t(0,120,\\fscx100\\fscy100)}"
+            rows.append(f"Dialogue: 0,{ass_time(local)},{ass_time(max(local+0.08,end))},Default,,0,0,0,,{tags}{text}")
+            local=end
+        cursor+=scene_duration
+    path.write_text(header+style+events+"\n".join(rows)+"\n",encoding="utf-8")
 
 def download_clip(url: str, path: Path):
     with requests.get(url,stream=True,timeout=90) as r:
@@ -191,11 +249,9 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
             update(progress=50+int(25*(i+1)/len(selected)),stage=f"Preparing scene {i+1}/{len(selected)}")
         concat=folder/"concat.txt"; concat.write_text("\n".join("file '"+p.name+"'" for p in segments),encoding="utf-8")
         silent=folder/"silent.mp4"; run(["ffmpeg","-y","-f","concat","-safe","0","-i",str(concat),"-c","copy",str(silent)],timeout=300)
-        final=folder/"content-tool.mp4"; srt=folder/"subtitles.srt"; write_srt([s for s,_ in selected],duration,srt)
-        update(stage="Burning subtitles and mixing audio",progress=80)
-        color=req.subtitle_color.lstrip("#")
-        back="BorderStyle=3,BackColour=&H90000000,Outline=0" if req.subtitle_background else "BorderStyle=1,Outline=2"
-        subtitle_filter=f"subtitles={srt.as_posix()}:force_style='FontName=DejaVu Sans,FontSize={req.subtitle_size},Bold=1,PrimaryColour=&H00{color[4:6]}{color[2:4]}{color[0:2]},{back},Shadow=1,Alignment=2,MarginV=70'"
+        final=folder/"content-tool.mp4"; ass=folder/"subtitles.ass"; write_ass([s for s,_ in selected],duration,ass,req)
+        update(stage="Burning your subtitle template and mixing audio",progress=80)
+        subtitle_filter=f"ass={ass.as_posix()}"
         cmd=["ffmpeg","-y","-threads","2","-filter_threads","1","-filter_complex_threads","1","-i",str(silent),"-i",str(voice)]
         has_music=bool(music_path and music_path.exists())
         if has_music: cmd += ["-i",str(music_path)]
