@@ -92,7 +92,7 @@ def search_clips(req: RenderRequest, sentence: str) -> list[dict]:
 def generate_voice(req: RenderRequest, script: str, out: Path):
     if not req.voice_key: raise RuntimeError("Add the selected voice provider API key in Settings.")
     if req.voice_provider=="fish":
-        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json"},json={"text":script,"reference_id":req.voice_id or FISH_DEFAULT_VOICE_ID,"format":"mp3","mp3_bitrate":128},timeout=240)
+        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json","model":"s2.1-pro-free"},json={"text":script,"reference_id":req.voice_id or FISH_DEFAULT_VOICE_ID,"format":"mp3","mp3_bitrate":128},timeout=240)
     else:
         voice=req.voice_id or "21m00Tcm4TlvDq8ikWAM"
         r=requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice}",headers={"xi-api-key":req.voice_key,"Content-Type":"application/json","Accept":"audio/mpeg"},json={"text":script,"model_id":"eleven_multilingual_v2","voice_settings":{"stability":0.48,"similarity_boost":0.78,"style":0.25,"use_speaker_boost":True}},timeout=240)
