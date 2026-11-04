@@ -27,7 +27,7 @@ class RenderRequest(BaseModel):
     pixabay_key: str = ""
     voice_provider: str = "elevenlabs"
     voice_key: str = ""
-    voice_id: str = FISH_DEFAULT_VOICE_ID
+    voice_id: str = Field(default=FISH_DEFAULT_VOICE_ID, max_length=128)
     aspect: str = "9:16"
     quality: str = "1080p"
     subtitle_size: int = Field(default=48, ge=12, le=72)
@@ -70,8 +70,20 @@ def tokens(text: str) -> set[str]:
 
 def score_clip(clip: dict, query: str) -> float:
     words = tokens(query)
-    tags = tokens(" ".join([clip.get("description",""), clip.get("url","")]))
+    metadata = " ".join(str(clip.get(k, "")) for k in ("title", "tags", "description", "url"))
+    tags = tokens(metadata)
     return len(words & tags) / max(1, len(words))
+
+
+def scene_search_queries(sentence: str, topic: str, keywords: str) -> list[str]:
+    """Build short scene-first searches with topic context and useful fallbacks."""
+    candidates = [
+        stock_search_query(sentence, topic, keywords, max_chars=88),
+        stock_search_query(sentence, max_chars=72),
+        stock_search_query(topic, sentence, max_chars=72),
+        stock_search_query(keywords, topic, max_chars=72),
+    ]
+    return list(dict.fromkeys(q for q in candidates if q))
 
 def pexels_search(key: str, query: str, per_page=12) -> list[dict]:
     if not key: return []
@@ -112,38 +124,38 @@ def stock_search_query(*parts: str, max_chars: int = 88) -> str:
 
 
 def search_clips(req: RenderRequest, sentence: str) -> list[dict]:
-    # Keep the scene first so each sentence gets relevant footage; user keywords
-    # are supplemental rather than being appended as a long unbounded string.
-    q = stock_search_query(sentence, req.topic, req.keywords, max_chars=88)
-    clips=[]
-    providers = [req.stock_provider] if req.stock_provider in ("pexels","pixabay") else ["pexels","pixabay"]
+    # Search each narration beat first, then try focused/contextual fallbacks.
+    queries = scene_search_queries(sentence, req.topic, req.keywords)
+    clips = []
+    providers = [req.stock_provider] if req.stock_provider in ("pexels", "pixabay") else ["pexels", "pixabay"]
     for provider in providers:
-        key = req.pexels_key or os.getenv("PEXELS_API_KEY","") if provider == "pexels" else req.pixabay_key or os.getenv("PIXABAY_API_KEY","")
+        key = (req.pexels_key or os.getenv("PEXELS_API_KEY", "")) if provider == "pexels" else (req.pixabay_key or os.getenv("PIXABAY_API_KEY", ""))
         if not key:
             continue
         try:
-            if provider == "pexels":
-                clips += pexels_search(key, q)
-            else:
-                # Pixabay accepts short q values; broaden only when a valid search
-                # returns no clips. Never include the API key in logged exceptions.
-                fallback_queries = [q, stock_search_query(req.topic, req.keywords, max_chars=70), stock_search_query(req.topic, max_chars=45)]
-                for fallback in dict.fromkeys(x for x in fallback_queries if x):
-                    found = pixabay_search(key, fallback)
-                    if found:
-                        clips += found
-                        break
+            for query in queries:
+                found = pexels_search(key, query) if provider == "pexels" else pixabay_search(key, query)
+                for clip in found:
+                    clip["search_query"] = query
+                clips.extend(found)
+                if len(clips) >= 8:
+                    break
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "unknown"
-            print(f"{provider} search warning: HTTP {status}; query length={len(q)}")
+            print(f"{provider} search warning: HTTP {status}; scene query attempts={len(queries)}")
         except Exception as e:
             print(f"{provider} search warning: {type(e).__name__}")
-    return sorted(clips,key=lambda c:score_clip(c, sentence+" "+req.topic),reverse=True)
+    unique = {}
+    for clip in clips:
+        if clip.get("url"):
+            unique.setdefault(clip["url"], clip)
+    return sorted(unique.values(), key=lambda c: score_clip(c, sentence), reverse=True)
 
 def generate_voice(req: RenderRequest, script: str, out: Path):
     if not req.voice_key: raise RuntimeError("Add the selected voice provider API key in Settings.")
     if req.voice_provider=="fish":
-        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json","model":"s2.1-pro-free"},json={"text":script,"reference_id":req.voice_id or FISH_DEFAULT_VOICE_ID,"format":"mp3","mp3_bitrate":128},timeout=240)
+        voice_id = req.voice_id.strip() or FISH_DEFAULT_VOICE_ID
+        r=requests.post("https://api.fish.audio/v1/tts",headers={"Authorization":f"Bearer {req.voice_key}","Content-Type":"application/json","model":"s2.1-pro-free"},json={"text":script,"reference_id":voice_id,"format":"mp3","mp3_bitrate":128},timeout=240)
     else:
         voice=req.voice_id or "21m00Tcm4TlvDq8ikWAM"
         r=requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice}",headers={"xi-api-key":req.voice_key,"Content-Type":"application/json","Accept":"audio/mpeg"},json={"text":script,"model_id":"eleven_multilingual_v2","voice_settings":{"stability":0.48,"similarity_boost":0.78,"style":0.25,"use_speaker_boost":True}},timeout=240)
@@ -226,12 +238,21 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         duration=ffprobe_duration(voice); sentences=split_sentences(req.script)
         if not sentences: raise RuntimeError("The script has no readable sentences.")
         update(stage="Searching stock footage",progress=14)
-        selected=[]; seen=set()
+        selected=[]; seen=set(); missing=[]
         for i,sentence in enumerate(sentences):
             clips=search_clips(req,sentence)
+            # Prefer a new clip, but reuse the best scene match rather than
+            # silently removing a narrated sentence when the library is sparse.
             best=next((c for c in clips if c["url"] not in seen),None)
-            if best: seen.add(best["url"]); selected.append((sentence,best))
+            if best is None and clips:
+                best=clips[0]
+            if best:
+                seen.add(best["url"]); selected.append((sentence,best))
+            else:
+                missing.append(i+1)
             update(progress=14+int(34*(i+1)/len(sentences)),stage=f"Matching scene {i+1}/{len(sentences)}")
+        if missing:
+            raise RuntimeError("No matching stock footage could be found for scene(s) "+", ".join(map(str,missing))+". Try adding more specific visual keywords or connecting both Pexels and Pixabay.")
         if not selected: raise RuntimeError("No stock footage found. Check your API keys and try broader keywords.")
         weights=[max(1,len(re.findall(r"\w+",s))) for s,_ in selected]; total=sum(weights)
         target=1080 if req.quality=="1080p" else 720
