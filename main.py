@@ -17,6 +17,9 @@ JOBS_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Content Tool", version="1.0.0")
 jobs: dict[str, dict] = {}
 lock = threading.Lock()
+# A single Railway replica has a limited memory budget. Queue renders so two
+# simultaneous x264 processes cannot exhaust the container's RAM.
+render_semaphore = threading.Semaphore(1)
 
 class RenderRequest(BaseModel):
     topic: str = Field(min_length=2, max_length=180)
@@ -397,7 +400,7 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         for i,(sentence,clip) in enumerate(selected):
             raw=folder/f"raw_{i}.mp4"; seg=folder/f"scene_{i}.mp4"; download_clip(clip["url"],raw)
             seg_duration=scene_durations[i]
-            run(["ffmpeg","-y","-threads","2","-filter_threads","1","-stream_loop","-1","-i",str(raw),"-t",f"{seg_duration:.3f}","-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps=30","-an","-c:v","libx264","-threads","2","-preset","ultrafast","-crf","23","-pix_fmt","yuv420p",str(seg)],timeout=300)
+            run(["ffmpeg","-y","-threads","1","-filter_threads","1","-filter_complex_threads","1","-stream_loop","-1","-i",str(raw),"-t",f"{seg_duration:.3f}","-vf",f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={width}:{height},setsar=1,fps=30,format=yuv420p","-an","-c:v","libx264","-threads","1","-preset","ultrafast","-tune","zerolatency","-x264-params","threads=1:lookahead-threads=1:sync-lookahead=0:rc-lookahead=0:ref=1:bframes=0","-crf","23","-pix_fmt","yuv420p",str(seg)],timeout=300)
             if not seg.exists() or seg.stat().st_size < 1024:
                 raise RuntimeError(f"FFmpeg did not produce a valid video file for scene {i+1}. The downloaded source may contain no decodable video frames.")
             segments.append(seg); raw.unlink(missing_ok=True)
@@ -407,15 +410,23 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         final=folder/"content-tool.mp4"; ass=folder/"subtitles.ass"; write_ass(req.script,duration,ass,req,voice_alignment)
         update(stage="Burning your subtitle template and mixing audio",progress=80)
         subtitle_filter=f"ass={ass.as_posix()}"
-        cmd=["ffmpeg","-y","-threads","2","-filter_threads","1","-filter_complex_threads","1","-i",str(silent),"-i",str(voice)]
+        cmd=["ffmpeg","-y","-threads","1","-filter_threads","1","-filter_complex_threads","1","-i",str(silent),"-i",str(voice)]
         has_music=bool(music_path and music_path.exists())
         if has_music: cmd += ["-i",str(music_path)]
         cmd += ["-vf",subtitle_filter,"-map","0:v:0","-map","1:a:0"]
         if has_music: cmd += ["-filter_complex",f"[2:a]volume={req.music_volume}[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]","-map","[a]"]
-        cmd += ["-c:v","libx264","-threads","2","-preset","ultrafast","-crf","22","-c:a","aac","-b:a","192k","-shortest","-movflags","+faststart",str(final)]
+        cmd += ["-c:v","libx264","-threads","1","-preset","ultrafast","-tune","zerolatency","-x264-params","threads=1:lookahead-threads=1:sync-lookahead=0:rc-lookahead=0:ref=1:bframes=0","-crf","23","-pix_fmt","yuv420p","-c:a","aac","-threads","1","-b:a","128k","-max_muxing_queue_size","512","-shortest","-movflags","+faststart",str(final)]
         run(cmd,timeout=900)
+        # Release intermediate media as soon as the final MP4 is complete.
+        for temporary in [*segments, silent, concat, voice, ass]:
+            try: temporary.unlink(missing_ok=True)
+            except OSError: pass
         update(status="completed",stage="Ready to download",progress=100,download_url=f"/api/jobs/{job_id}/download",scenes=[{"sentence":s,"source":c["source"],"duration":round(scene_durations[i],1),"start":round(scene_windows[i][0],2),"end":round(scene_windows[i][1],2),"visual_query":c.get("search_query", ""),"match_score":round(c.get("match_score",0),2)} for i,(s,c) in enumerate(selected)],subtitle_sync=("Fish Audio word timestamps" if voice_alignment else "estimated timing"))
     except Exception as e: update(status="failed",stage="Render failed",error=str(e)[:1600],progress=100)
+
+def queued_render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
+    with render_semaphore:
+        render_job(job_id, req, music_path)
 
 @app.get("/api/health")
 def health(): return {"ok":True,"service":"Content Tool"}
@@ -479,7 +490,7 @@ async def create_job(request: Request):
         music_path=folder/f"background{ext}"; music_path.write_bytes(await music.read())
     job_id=uuid.uuid4().hex[:12]
     with lock: jobs[job_id]={"id":job_id,"status":"queued","stage":"Waiting to start","progress":0,"created":time.time()}
-    threading.Thread(target=render_job,args=(job_id,req,music_path),daemon=True).start()
+    threading.Thread(target=queued_render_job,args=(job_id,req,music_path),daemon=True).start()
     return {"id":job_id,"status":"queued"}
 
 @app.get("/api/jobs/{job_id}")
