@@ -26,6 +26,7 @@ class RenderRequest(BaseModel):
     script: str = Field(min_length=20, max_length=12000)
     keywords: str = Field(default="", max_length=1000)
     stock_provider: str = "both"
+    video_style: str = "stock"
     pexels_key: str = ""
     pixabay_key: str = ""
     voice_provider: str = "elevenlabs"
@@ -377,6 +378,42 @@ def download_clip(url: str, path: Path):
                 if chunk: f.write(chunk)
     if path.stat().st_size < 12000: raise RuntimeError("Downloaded stock clip is unexpectedly small.")
 
+def render_motion_graphics_scene(sentence: str, topic: str, seg: Path, seg_duration: float, width: int, height: int, folder: Path, index: int):
+    """Render a clean 2D motion-graphics explainer scene; narration stays in subtitles only."""
+    words = [w for w in re.findall(r"[A-Za-z0-9]{3,}", sentence) if w.lower() not in SCENE_STOPWORDS]
+    labels = list(dict.fromkeys(words))[:3] or ["Key idea", "Explained"]
+    label_files = []
+    for n, label in enumerate(labels):
+        f = folder / f"motion_{index}_label_{n}.txt"
+        f.write_text(label[:22], encoding="utf-8")
+        label_files.append(f)
+    topic_file = folder / f"motion_{index}_topic.txt"
+    topic_file.write_text((topic or "THE BIG IDEA")[:44].upper(), encoding="utf-8")
+    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    small = max(18, int(height * 0.025)); label_size = max(24, int(height * 0.043))
+    # Each beat gets a moving infographic composition: orbiting blocks, animated
+    # connector bars and concise concept labels. The narration is never drawn here.
+    x1 = f"(w*0.18)+(sin(t*1.7+{index})*w*0.045)"
+    x2 = f"(w*0.62)+(cos(t*1.3+{index})*w*0.045)"
+    y1 = f"(h*0.36)+(sin(t*1.1+{index})*h*0.035)"
+    y2 = f"(h*0.61)+(cos(t*1.5+{index})*h*0.035)"
+    filters = [
+        f"drawbox=x=0:y=0:w=iw:h={max(6,height//150)}:color=0x8b7cff:t=fill",
+        f"drawbox=x={x1}:y={y1}:w={int(width*.20)}:h={max(12,int(height*.012))}:color=0x8b7cff@0.95:t=fill",
+        f"drawbox=x={x2}:y={y2}:w={int(width*.20)}:h={max(12,int(height*.012))}:color=0x42d9c8@0.95:t=fill",
+        f"drawbox=x={x1}:y={y1}:w={int(width*.20)}:h={int(height*.15)}:color=0x222b49@0.95:t=fill",
+        f"drawbox=x={x2}:y={y2}:w={int(width*.20)}:h={int(height*.15)}:color=0x173c48@0.95:t=fill",
+        f"drawtext=fontfile={font}:textfile={topic_file.as_posix()}:fontcolor=0xAEB8FF:fontsize={small}:x=(w-text_w)/2:y=h*0.13",
+        f"drawtext=fontfile={font}:textfile={label_files[0].as_posix()}:fontcolor=white:fontsize={label_size}:x=(w-text_w)/2:y=h*0.405",
+    ]
+    if len(label_files) > 1:
+        filters.append(f"drawtext=fontfile={font}:textfile={label_files[1].as_posix()}:fontcolor=0x9CF5E8:fontsize={label_size}:x=(w-text_w)/2:y=h*0.655")
+    if len(label_files) > 2:
+        filters.append(f"drawtext=fontfile={font}:textfile={label_files[2].as_posix()}:fontcolor=0xD7D4FF:fontsize={max(18,int(label_size*.72))}:x=(w-text_w)/2:y=h*0.82")
+    filters.append("format=yuv420p")
+    vf=",".join(filters)
+    run(["ffmpeg","-y","-f","lavfi","-i",f"color=c=0x0B1020:s={width}x{height}:r=30","-t",f"{seg_duration:.3f}","-vf",vf,"-an","-c:v","libx264","-threads","1","-preset","ultrafast","-tune","zerolatency","-x264-params","threads=1:lookahead-threads=1:sync-lookahead=0:rc-lookahead=0:ref=1:bframes=0","-crf","26","-pix_fmt","yuv420p",str(seg)],timeout=180)
+
 def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
     folder=JOBS_DIR/job_id; folder.mkdir(parents=True,exist_ok=True)
     def update(**kw):
@@ -386,22 +423,23 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         voice=folder/("voice.opus" if req.voice_provider == "fish" else "voice.mp3"); voice_alignment=generate_voice(req,req.script,voice)
         duration=ffprobe_duration(voice); sentences=split_sentences(req.script)
         if not sentences: raise RuntimeError("The script has no readable sentences.")
-        update(stage="Searching stock footage",progress=14)
         selected=[]; seen=set(); generated_scene_count=0
-        for i,sentence in enumerate(sentences):
-            clips=search_clips(req,sentence)
-            # Require independent evidence in the clip's own title/tags/alt text.
-            # Never treat the query we created from the script as proof of a match.
-            best=next((c for c in clips if c.get("url") not in seen and c.get("match_score",0) >= 0.24),None)
-            if best:
-                seen.add(best["url"]); selected.append((sentence,best))
-            else:
-                # Guaranteed script-specific fallback: render the actual narration
-                # beat and topic as a designed motion scene instead of inserting
-                # unrelated stock footage or omitting the sentence.
-                selected.append((sentence,{"url":None,"source":"FAST FLOW scene card","match_score":1.0,"generated_scene_card":True}))
-                generated_scene_count += 1
-            update(progress=14+int(34*(i+1)/len(sentences)),stage=f"Matching scene {i+1}/{len(sentences)}")
+        if req.video_style == "motion_graphics":
+            update(stage="Designing motion-graphics explainer scenes",progress=14)
+            selected=[(sentence,{"url":None,"source":"FAST FLOW Motion Graphics","match_score":1.0,"generated_motion_scene":True}) for sentence in sentences]
+            generated_scene_count=len(selected)
+        else:
+            update(stage="Searching stock footage",progress=14)
+            for i,sentence in enumerate(sentences):
+                clips=search_clips(req,sentence)
+                best=next((c for c in clips if c.get("url") not in seen and c.get("match_score",0) >= 0.24),None)
+                if best:
+                    seen.add(best["url"]); selected.append((sentence,best))
+                else:
+                    # Use abstract motion graphics, never a full-script text card.
+                    selected.append((sentence,{"url":None,"source":"FAST FLOW Motion Graphics fallback","match_score":1.0,"generated_motion_scene":True}))
+                    generated_scene_count += 1
+                update(progress=14+int(34*(i+1)/len(sentences)),stage=f"Matching scene {i+1}/{len(sentences)}")
         if not selected: raise RuntimeError("No scenes could be prepared from this script.")
         if generated_scene_count:
             update(stage=f"Creating {generated_scene_count} script-matched visual scene(s)",progress=47)
@@ -418,21 +456,8 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         for i,(sentence,clip) in enumerate(selected):
             seg=folder/f"scene_{i}.mp4"
             seg_duration=scene_durations[i]
-            if clip.get("generated_scene_card"):
-                # No trustworthy stock match: create a clean animated-video scene
-                # that explicitly displays this exact script beat and its topic.
-                caption_path=folder/f"scene_{i}_caption.txt"
-                topic_path=folder/f"scene_{i}_topic.txt"
-                caption_path.write_text(textwrap.fill(sentence, width=25),encoding="utf-8")
-                topic_path.write_text(textwrap.fill(req.topic.strip() or "Your video", width=34),encoding="utf-8")
-                font="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-                small=max(22,int(target*0.035)); large=max(30,int(target*0.060))
-                vf=(f"drawbox=x=0:y=0:w=iw:h={max(8,target//90)}:color=0x8b7cff:t=fill,"
-                    f"drawtext=fontfile={font}:textfile={topic_path.as_posix()}:fontcolor=0xBFC4FF:fontsize={small}:"
-                    f"x=(w-text_w)/2:y=h*0.25,"
-                    f"drawtext=fontfile={font}:textfile={caption_path.as_posix()}:fontcolor=white:fontsize={large}:"
-                    f"line_spacing=14:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=0x202A44@0.92:boxborderw=32,format=yuv420p")
-                run(["ffmpeg","-y","-f","lavfi","-i",f"color=c=0x101827:s={width}x{height}:r=30","-t",f"{seg_duration:.3f}","-vf",vf,"-an","-c:v","libx264","-threads","1","-preset","ultrafast","-tune","zerolatency","-x264-params","threads=1:lookahead-threads=1:sync-lookahead=0:rc-lookahead=0:ref=1:bframes=0","-crf","26","-pix_fmt","yuv420p",str(seg)],timeout=180)
+            if clip.get("generated_motion_scene"):
+                render_motion_graphics_scene(sentence, req.topic, seg, seg_duration, width, height, folder, i)
             else:
                 raw=folder/f"raw_{i}.mp4"
                 download_clip(clip["url"],raw)
@@ -535,8 +560,8 @@ async def create_job(request: Request):
         try: req=RenderRequest.model_validate(await request.json())
         except Exception as e: raise HTTPException(422,str(e))
         music=None
-    if not req.pexels_key and not req.pixabay_key and not os.getenv("PEXELS_API_KEY") and not os.getenv("PIXABAY_API_KEY"):
-        raise HTTPException(400,"Add at least one stock footage API key.")
+    if req.video_style != "motion_graphics" and not req.pexels_key and not req.pixabay_key and not os.getenv("PEXELS_API_KEY") and not os.getenv("PIXABAY_API_KEY"):
+        raise HTTPException(400,"Add at least one stock footage API key, or choose Motion Graphics Explainer mode.")
     if music and isinstance(music,UploadFile):
         if music.content_type not in ("audio/mpeg","audio/mp3","audio/wav","audio/x-wav","audio/mp4","audio/aac","audio/ogg"):
             raise HTTPException(400,"Unsupported music file type.")
