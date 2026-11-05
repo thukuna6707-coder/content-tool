@@ -2,6 +2,41 @@ const $=id=>document.getElementById(id);
 const STORE='contentTool.settings.v2',DRAFT='contentTool.draft.v2';
 const keys={pexels:'',pixabay:'',eleven:'',fish:''};
 const fishDefaultVoice='bf322df2096a46f18c579d0baa36f41d';
+const ICON_PATHS={
+  sparkles:'<path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="m19 14 .9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9L19 14Z"/>',
+  play:'<path d="m8 5 12 7-12 7V5Z"/>',
+  refresh:'<path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9a7 7 0 0 1 11.8-2L20 12M4 12l2.7 5a7 7 0 0 0 11.8-2"/>',
+  check:'<path d="m5 12 4 4L19 6"/>',
+  copy:'<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
+  download:'<path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 17v3h14v-3"/>',
+  settings:'<path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/><path d="m19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.6a8 8 0 0 1-1.7 1l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-1.7-1l-1.7.6-1.4-2.4 1.4-1.1a8 8 0 0 1 0-2l-1.4-1.1 1.4-2.4 1.7.6a8 8 0 0 1 1.7-1l.3-1.8h2.8l.3 1.8a8 8 0 0 1 1.7 1l1.7-.6 1.4 2.4-1.4 1.1a8 8 0 0 1 0 2Z"/>',
+  vertical:'<rect x="8" y="3" width="8" height="18" rx="1.5"/><path d="M11 18h2"/>',
+  landscape:'<rect x="3" y="6" width="18" height="12" rx="1.5"/><path d="M11 15h2"/>',
+  square:'<rect x="4" y="4" width="16" height="16" rx="1.5"/>',
+  type:'<path d="M4 6V4h16v2M12 4v16m-4 0h8"/>',
+  trash:'<path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3"/>',
+  save:'<path d="M5 3h12l4 4v14H3V3h2Z"/><path d="M7 3v6h10V3M7 21v-8h10v8"/>',
+  search:'<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
+  wand:'<path d="m15 4 5 5M4 20 17 7M5 5l1 2 2 1-2 1-1 2-1-2-2-1 2-1 1-2ZM18 14l1 2 2 1-2 1-1 2-1-2-2-1 2-1 1-2Z"/>',
+  arrow:'<path d="M5 12h14m-6-6 6 6-6 6"/>'
+};
+function iconSvg(name){return `<svg class="ui-icon auto-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICON_PATHS[name]||ICON_PATHS.sparkles}</svg>`}
+function ensureButtonIcons(root=document){root.querySelectorAll('button').forEach(button=>{
+  if(button.querySelector('svg,.ui-icon')) return;
+  const text=(button.getAttribute('aria-label')||button.textContent||'').toLowerCase();
+  let key='sparkles';
+  if(/vertical|portrait|9:16/.test(text))key='vertical'; else if(/landscape|16:9/.test(text))key='landscape'; else if(/square|1:1/.test(text))key='square';
+  else if(/preview|play|start/.test(text))key='play'; else if(/download|export/.test(text))key='download';
+  else if(/copy|clipboard/.test(text))key='copy'; else if(/clear|delete|remove/.test(text))key='trash';
+  else if(/save|done|apply/.test(text))key='save'; else if(/reset|reload|refresh|load voices/.test(text))key='refresh';
+  else if(/search|find|keyword/.test(text))key='search'; else if(/script|sentence|word highlight|subtitle/.test(text))key='type';
+  else if(/setting|key|manage/.test(text))key='settings'; else if(/hook|generate|create|build|render/.test(text))key='wand';
+  else if(/next|continue/.test(text))key='arrow';
+  if(button.querySelector('b') && button.classList.contains('choice')) button.querySelector('b').innerHTML=iconSvg(key);
+  else button.insertAdjacentHTML('afterbegin',iconSvg(key));
+  button.classList.add('has-auto-icon');
+});}
+
 let aspect='9:16',quality='1080p',musicFile=null,activeJob=null,sceneRows=[],savedFishVoice=fishDefaultVoice;
 const sample='Chocolate begins with cacao pods growing on trees in tropical regions. Farmers harvest the ripe pods and carefully open them to collect the cocoa beans. The beans are fermented for several days, then dried under the sun to develop their flavor. Next, they are roasted and cracked to separate the cocoa nibs from their shells. The nibs are ground into a thick paste called chocolate liquor. Sugar and other ingredients are blended in, and the mixture is refined until it becomes smooth. Finally, the chocolate is tempered, poured into molds, cooled, and packaged.';
 function toast(msg){$('toast').textContent=msg;$('toast').classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').classList.remove('show'),2600)}
@@ -77,3 +112,4 @@ $('resetSubtitleStyle').onclick=()=>{const t=subtitleTemplates.find(x=>x.id==='c
 window.addEventListener('resize',refreshSubtitlePreview);renderSubtitleTemplates();refreshSubtitlePreview();
 
 loadSettings();restoreDraft();updateCount();refreshSubtitlePreview();$('volumeValue').textContent=Math.round(+$('musicVolume').value*100)+'%';
+ensureButtonIcons();new MutationObserver(()=>ensureButtonIcons()).observe(document.body,{childList:true,subtree:true});

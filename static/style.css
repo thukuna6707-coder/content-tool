@@ -24,3 +24,9 @@ body{background:radial-gradient(ellipse at 78% -10%,#3a3a3a 0,transparent 32%),r
 .ui-icon{width:17px;height:17px;display:inline-block;vertical-align:middle;flex:none}.icon-btn{display:grid;place-items:center}.icon-btn .ui-icon{width:17px;height:17px}.nav .ui-icon{width:16px;height:16px;margin-right:12px;vertical-align:-3px}.tool-icon .ui-icon{width:18px;height:18px}.choice b .ui-icon{width:20px;height:20px;margin-bottom:4px}.orb-core .ui-icon{width:20px;height:20px}.tag .ui-icon{width:12px;height:12px;margin-right:6px;vertical-align:-2px}.upload>span .ui-icon{width:17px;height:17px}.provider-icon .ui-icon{width:16px;height:16px}.render-btn .ui-icon{width:15px;height:15px;margin:0 5px;vertical-align:-3px}.success-icon .ui-icon{width:18px;height:18px}.download-btn .ui-icon{width:14px;height:14px;margin-left:5px}.live-indicator{display:inline-block;width:6px;height:6px;border-radius:50%;background:#60d6a3;box-shadow:0 0 9px #60d6a388;margin-right:5px}
 
 .secondary-btn .ui-icon,.text-btn .ui-icon{width:13px;height:13px;margin-right:5px;vertical-align:-2px}.text-btn{display:inline-flex;align-items:center}.secondary-btn{display:inline-flex;align-items:center;justify-content:center}
+
+/* Consistent icon treatment for all controls, including dynamically-created buttons. */
+button .ui-icon{width:15px;height:15px;flex:none;vertical-align:middle;margin-right:7px}
+button.icon-btn .ui-icon{margin:0;width:17px;height:17px}
+button.choice b .ui-icon{display:block;margin:0 auto 4px;width:20px;height:20px}
+button.has-auto-icon{display:inline-flex;align-items:center;justify-content:center;gap:2px}

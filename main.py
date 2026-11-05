@@ -88,11 +88,14 @@ def score_clip(clip: dict, sentence: str) -> float:
 
 def scene_search_queries(sentence: str, topic: str, keywords: str) -> list[str]:
     """Build short scene-first searches with topic context and useful fallbacks."""
+    scene_terms = stock_search_query(sentence, max_chars=58)
+    topic_terms = stock_search_query(topic, max_chars=28)
+    keyword_terms = stock_search_query(keywords, max_chars=42)
     candidates = [
-        stock_search_query(sentence, topic, keywords, max_chars=88),
-        stock_search_query(sentence, max_chars=72),
-        stock_search_query(topic, sentence, max_chars=72),
-        stock_search_query(keywords, topic, max_chars=72),
+        stock_search_query(scene_terms, topic_terms, max_chars=78),
+        scene_terms,
+        stock_search_query(topic_terms, scene_terms, max_chars=72),
+        stock_search_query(keyword_terms, scene_terms, max_chars=72),
     ]
     return list(dict.fromkeys(q for q in candidates if q))
 
@@ -102,8 +105,11 @@ def pexels_search(key: str, query: str, per_page=12) -> list[dict]:
     r.raise_for_status()
     out=[]
     for v in r.json().get("videos",[]):
-        files=sorted(v.get("video_files",[]), key=lambda x:(x.get("width",0)*x.get("height",0), x.get("quality")=="hd"), reverse=True)
-        f=next((x for x in files if x.get("file_type")=="video/mp4" and x.get("link")), None)
+        files=[x for x in v.get("video_files",[]) if x.get("file_type")=="video/mp4" and x.get("link")]
+        # Avoid downloading 2K/4K stock masters into a small Railway container.
+        # Prefer the best source at or below 720p; if none exists, choose the smallest.
+        safe=[x for x in files if int(x.get("width",0) or 0)*int(x.get("height",0) or 0) <= 1280*720]
+        f=max(safe or files, key=lambda x:int(x.get("width",0) or 0)*int(x.get("height",0) or 0), default=None)
         if f:
             user=v.get("user") or {}
             out.append({"url":f["link"],"description":str(v.get("alt") or ""),"alt":str(v.get("alt") or ""),"source":"Pexels","video_page":v.get("url","")})
@@ -115,7 +121,7 @@ def pixabay_search(key: str, query: str, per_page=12) -> list[dict]:
     r.raise_for_status()
     out=[]
     for v in r.json().get("hits",[]):
-        videos=v.get("videos",{}); f=videos.get("large") or videos.get("medium") or videos.get("small")
+        videos=v.get("videos",{}); f=videos.get("medium") or videos.get("small") or videos.get("large")
         if f and f.get("url"):
             out.append({"url":f["url"],"description":v.get("tags", ""),"tags":v.get("tags", ""),"source":"Pixabay"})
     return out
@@ -393,9 +399,10 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         if len(scene_durations) != len(selected):
             raise RuntimeError("Scene timing could not be aligned with the narration script. Please retry.")
         target=1080 if req.quality=="1080p" else 720
-        if req.aspect=="16:9": width,height=target,int(target*9/16)
+        portrait_width=max(2, int(round((target*9/16)/2))*2)
+        if req.aspect=="16:9": width,height=target,portrait_width
         elif req.aspect=="1:1": width=height=target
-        else: width,height=int(target*9/16),target
+        else: width,height=portrait_width,target
         segments=[]; update(stage="Downloading and assembling scenes",progress=50)
         for i,(sentence,clip) in enumerate(selected):
             raw=folder/f"raw_{i}.mp4"; seg=folder/f"scene_{i}.mp4"; download_clip(clip["url"],raw)
@@ -416,7 +423,25 @@ def render_job(job_id: str, req: RenderRequest, music_path: Optional[Path]):
         cmd += ["-vf",subtitle_filter,"-map","0:v:0","-map","1:a:0"]
         if has_music: cmd += ["-filter_complex",f"[2:a]volume={req.music_volume}[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]","-map","[a]"]
         cmd += ["-c:v","libx264","-threads","1","-preset","ultrafast","-tune","zerolatency","-x264-params","threads=1:lookahead-threads=1:sync-lookahead=0:rc-lookahead=0:ref=1:bframes=0","-crf","23","-pix_fmt","yuv420p","-c:a","aac","-threads","1","-b:a","128k","-max_muxing_queue_size","512","-shortest","-movflags","+faststart",str(final)]
-        run(cmd,timeout=900)
+        try:
+            run(cmd,timeout=900)
+        except RuntimeError as render_error:
+            # Railway may still kill the first pass under a tight memory quota.
+            # Retry once with a bounded 720p frame, 24fps, and a lower-memory
+            # scale path. Keep the selected aspect ratio and subtitle timing.
+            if "signal 9" not in str(render_error).lower():
+                raise
+            safe_target=720
+            safe_width=max(2, int(round((safe_target*9/16)/2))*2)
+            if req.aspect=="16:9": safe_w,safe_h=safe_target,safe_width
+            elif req.aspect=="1:1": safe_w=safe_h=safe_target
+            else: safe_w,safe_h=safe_width,safe_target
+            low_memory_filter=(f"scale={safe_w}:{safe_h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                               f"pad={safe_w}:{safe_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,{subtitle_filter}")
+            cmd[cmd.index("-vf")+1]=low_memory_filter
+            cmd[cmd.index("-crf")+1]="28"
+            update(stage="Retrying in memory-safe 720p mode",progress=86)
+            run(cmd,timeout=1200)
         # Release intermediate media as soon as the final MP4 is complete.
         for temporary in [*segments, silent, concat, voice, ass]:
             try: temporary.unlink(missing_ok=True)
